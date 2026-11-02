@@ -1,20 +1,13 @@
-import 'dart:convert';
+import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:firebase_auth/firebase_auth.dart';
+import 'package:firebase_core/firebase_core.dart';
 import 'package:flutter/material.dart';
-import 'package:shared_preferences/shared_preferences.dart';
 import 'weather.dart';
+import 'auth_gate.dart';
 
-class Candidate {
-  Candidate(this.name, [this.votes = 0]);
-  String name;
-  int votes;
-
-  Map<String, dynamic> toJson() => {'name': name, 'votes': votes};
-  factory Candidate.fromJson(Map<String, dynamic> json) {
-    return Candidate(json['name'] as String, json['votes'] as int);
-  }
-}
-
-void main() {
+Future<void> main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  await Firebase.initializeApp();
   runApp(const ElectionApp());
 }
 
@@ -24,6 +17,41 @@ String cleanName(String raw) {
       .where((w) => w.isNotEmpty)
       .map((w) => w[0].toUpperCase() + w.substring(1).toLowerCase())
       .join(' ');
+}
+
+class Candidate {
+  Candidate({this.id = '', required this.name, this.votes = 0});
+  final String id;
+  final String name;
+  final int votes;
+
+  Map<String, dynamic> toMap() => {'name': name, 'votes': votes};
+
+  factory Candidate.fromDoc(DocumentSnapshot<Map<String, dynamic>> doc) {
+    final data = doc.data()!;
+    return Candidate(
+      id: doc.id,
+      name: data['name'] as String,
+      votes: (data['votes'] as num).toInt(),
+    );
+  }
+}
+
+CollectionReference<Map<String, dynamic>> myCandidates() {
+  final uid = FirebaseAuth.instance.currentUser!.uid;
+  return FirebaseFirestore.instance
+      .collection('users')
+      .doc(uid)
+      .collection('candidates');
+}
+
+// NEW: This tracks who has voted so they can't vote twice
+CollectionReference<Map<String, dynamic>> myVoters() {
+  final uid = FirebaseAuth.instance.currentUser!.uid;
+  return FirebaseFirestore.instance
+      .collection('users')
+      .doc(uid)
+      .collection('voters');
 }
 
 class ElectionApp extends StatelessWidget {
@@ -56,7 +84,7 @@ class ElectionApp extends StatelessWidget {
           ),
         ),
       ),
-      home: const VoteScreen(),
+      home: const AuthGate(),
     );
   }
 }
@@ -69,8 +97,6 @@ class VoteScreen extends StatefulWidget {
 }
 
 class _VoteScreenState extends State<VoteScreen> {
-  final candidates = <Candidate>[];
-  final voters = <String>{};
   final voterController = TextEditingController();
 
   // API State
@@ -81,7 +107,6 @@ class _VoteScreenState extends State<VoteScreen> {
   @override
   void initState() {
     super.initState();
-    loadData();
     loadWeather();
   }
 
@@ -89,34 +114,6 @@ class _VoteScreenState extends State<VoteScreen> {
   void dispose() {
     voterController.dispose();
     super.dispose();
-  }
-
-  Future<void> loadData() async {
-    final prefs = await SharedPreferences.getInstance();
-    final saved = prefs.getString('candidates');
-    final savedVoters = prefs.getStringList('voters');
-
-    setState(() {
-      if (saved != null) {
-        final list = jsonDecode(saved) as List;
-        candidates.clear();
-        candidates.addAll(list.map((x) => Candidate.fromJson(x)).toList());
-      } else {
-        candidates.addAll([Candidate('Keza'), Candidate('Mutoni'), Candidate('Gisa')]);
-      }
-
-      if (savedVoters != null) {
-        voters.clear();
-        voters.addAll(savedVoters);
-      }
-    });
-  }
-
-  Future<void> saveData() async {
-    final prefs = await SharedPreferences.getInstance();
-    final list = candidates.map((c) => c.toJson()).toList();
-    await prefs.setString('candidates', jsonEncode(list));
-    await prefs.setStringList('voters', voters.toList());
   }
 
   Future<void> loadWeather() async {
@@ -138,7 +135,7 @@ class _VoteScreenState extends State<VoteScreen> {
     }
   }
 
-  void vote(Candidate c) {
+  void vote(Candidate c) async {
     final cleaned = cleanName(voterController.text);
 
     if (cleaned.isEmpty) {
@@ -146,17 +143,20 @@ class _VoteScreenState extends State<VoteScreen> {
       return;
     }
 
-    final key = cleaned.toLowerCase();
-    if (voters.contains(key)) {
+    // 1. Check if the voter already exists in Firestore
+    final existingVoter = await myVoters().where('name', isEqualTo: cleaned.toLowerCase()).get();
+    if (existingVoter.docs.isNotEmpty) {
       _toast('$cleaned has already voted', Colors.orange.shade700);
       return;
     }
 
-    setState(() {
-      c.votes += 1;
-      voters.add(key);
+    // 2. Record the voter
+    await myVoters().add({'name': cleaned.toLowerCase()});
+
+    // 3. Increment the vote
+    await myCandidates().doc(c.id).update({
+      'votes': FieldValue.increment(1),
     });
-    saveData();
 
     _toast('$cleaned voted for ${c.name}', Colors.green.shade600);
     voterController.clear();
@@ -178,34 +178,8 @@ class _VoteScreenState extends State<VoteScreen> {
       );
   }
 
-  void openCandidates() {
-    Navigator.push(
-      context,
-      MaterialPageRoute(
-        builder: (context) => CandidatesScreen(candidates: candidates),
-      ),
-    ).then((_) {
-      setState(() {});
-      saveData();
-    });
-  }
-
-  void openResults() {
-    Navigator.push(
-      context,
-      MaterialPageRoute(
-        builder: (context) => ResultsScreen(candidates: candidates, onReset: saveData),
-      ),
-    ).then((_) {
-      setState(() {});
-    });
-  }
-
   @override
   Widget build(BuildContext context) {
-    final totalVotes = candidates.fold<int>(0, (s, c) => s + c.votes);
-    final votersCount = voters.length;
-
     return Scaffold(
       appBar: AppBar(
         title: const Text('Class Election'),
@@ -213,125 +187,143 @@ class _VoteScreenState extends State<VoteScreen> {
           IconButton(
             icon: const Icon(Icons.people_outline),
             tooltip: 'Candidates',
-            onPressed: openCandidates,
+            onPressed: () => Navigator.push(
+              context,
+              MaterialPageRoute(builder: (context) => const CandidatesScreen()),
+            ),
           ),
           IconButton(
             icon: const Icon(Icons.bar_chart),
             tooltip: 'Results',
-            onPressed: openResults,
+            onPressed: () => Navigator.push(
+              context,
+              MaterialPageRoute(builder: (context) => const ResultsScreen()),
+            ),
+          ),
+          IconButton(
+            icon: const Icon(Icons.logout),
+            tooltip: 'Log out',
+            onPressed: () => FirebaseAuth.instance.signOut(),
           ),
         ],
       ),
-      body: Column(
-        children: [
-          // API & Stats Container
-          Container(
-            width: double.infinity,
-            margin: const EdgeInsets.fromLTRB(16, 16, 16, 8),
-            padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 18),
-            decoration: BoxDecoration(
-              gradient: const LinearGradient(
-                colors: [Color(0xFF4F46E5), Color(0xFF7C3AED)],
-                begin: Alignment.topLeft,
-                end: Alignment.bottomRight,
-              ),
-              borderRadius: BorderRadius.circular(20),
-              boxShadow: [
-                BoxShadow(
-                  color: const Color(0xFF4F46E5).withValues(alpha: 0.25),
-                  blurRadius: 16,
-                  offset: const Offset(0, 6),
-                ),
-              ],
-            ),
-            child: loadingWeather
-                ? const Center(child: CircularProgressIndicator(color: Colors.white))
-                : weatherError
-                ? Column(
-              children: [
-                const Icon(Icons.wifi_off, color: Colors.white),
-                const SizedBox(height: 4),
-                const Text('Could not load live weather', style: TextStyle(color: Colors.white)),
-                const SizedBox(height: 4),
-                TextButton(
-                  onPressed: loadWeather,
-                  child: const Text('Retry', style: TextStyle(color: Colors.white, decoration: TextDecoration.underline)),
-                ),
-              ],
-            )
-                : Row(
-              children: [
-                Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    const Text('Live API', style: TextStyle(color: Colors.white70, fontSize: 12)),
-                    Text('Kigali: ${weather!.temperature.round()}°C', style: const TextStyle(color: Colors.white, fontSize: 16, fontWeight: FontWeight.w700)),
+      body: StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
+        stream: myCandidates().snapshots(),
+        builder: (context, snapshot) {
+          if (snapshot.hasError) {
+            return Center(child: Text('Error: ${snapshot.error}'));
+          }
+          if (!snapshot.hasData) {
+            return const Center(child: CircularProgressIndicator());
+          }
+
+          final candidates = snapshot.data!.docs.map(Candidate.fromDoc).toList();
+          final totalVotes = candidates.fold<int>(0, (s, c) => s + c.votes);
+
+          return Column(
+            children: [
+              Container(
+                width: double.infinity,
+                margin: const EdgeInsets.fromLTRB(16, 16, 16, 8),
+                padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 18),
+                decoration: BoxDecoration(
+                  gradient: const LinearGradient(
+                    colors: [Color(0xFF4F46E5), Color(0xFF7C3AED)],
+                    begin: Alignment.topLeft,
+                    end: Alignment.bottomRight,
+                  ),
+                  borderRadius: BorderRadius.circular(20),
+                  boxShadow: [
+                    BoxShadow(
+                      color: const Color(0xFF4F46E5).withValues(alpha: 0.25),
+                      blurRadius: 16,
+                      offset: const Offset(0, 6),
+                    ),
                   ],
                 ),
-                const SizedBox(width: 20),
-                Expanded(child: _stat('Voters', '$votersCount')),
-                Container(
-                  width: 1,
-                  height: 40,
-                  color: Colors.white.withValues(alpha: 0.3),
-                ),
-                Expanded(child: _stat('Total votes', '$totalVotes')),
-                Container(
-                  width: 1,
-                  height: 40,
-                  color: Colors.white.withValues(alpha: 0.3),
-                ),
-                Expanded(
-                  child: _stat('Candidates', '${candidates.length}'),
-                ),
-              ],
-            ),
-          ),
-
-          Padding(
-            padding: const EdgeInsets.fromLTRB(16, 8, 16, 4),
-            child: TextField(
-              controller: voterController,
-              textCapitalization: TextCapitalization.words,
-              decoration: InputDecoration(
-                labelText: 'Your name',
-                hintText: 'e.g. Aline Uwase',
-                prefixIcon: const Icon(Icons.person_outline),
-                filled: true,
-                fillColor: Colors.white,
-                border: OutlineInputBorder(
-                  borderRadius: BorderRadius.circular(14),
-                  borderSide: BorderSide.none,
-                ),
-                enabledBorder: OutlineInputBorder(
-                  borderRadius: BorderRadius.circular(14),
-                  borderSide: BorderSide.none,
+                child: loadingWeather
+                    ? const Center(child: CircularProgressIndicator(color: Colors.white))
+                    : weatherError
+                    ? Column(
+                  children: [
+                    const Icon(Icons.wifi_off, color: Colors.white),
+                    const SizedBox(height: 4),
+                    const Text('Could not load live weather', style: TextStyle(color: Colors.white)),
+                    const SizedBox(height: 4),
+                    TextButton(
+                      onPressed: loadWeather,
+                      child: const Text('Retry', style: TextStyle(color: Colors.white, decoration: TextDecoration.underline)),
+                    ),
+                  ],
+                )
+                    : Row(
+                  children: [
+                    Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        const Text('Live API', style: TextStyle(color: Colors.white70, fontSize: 12)),
+                        Text('Kigali: ${weather!.temperature.round()}°C', style: const TextStyle(color: Colors.white, fontSize: 16, fontWeight: FontWeight.w700)),
+                      ],
+                    ),
+                    const SizedBox(width: 20),
+                    Expanded(child: _stat('Total votes', '$totalVotes')),
+                    Container(
+                      width: 1,
+                      height: 40,
+                      color: Colors.white.withValues(alpha: 0.3),
+                    ),
+                    Expanded(
+                      child: _stat('Candidates', '${candidates.length}'),
+                    ),
+                  ],
                 ),
               ),
-            ),
-          ),
-          Expanded(
-            child: candidates.isEmpty
-                ? const Center(
-              child: Text(
-                'No candidates yet',
-                style: TextStyle(fontSize: 16, color: Colors.grey),
+              Padding(
+                padding: const EdgeInsets.fromLTRB(16, 8, 16, 4),
+                child: TextField(
+                  controller: voterController,
+                  textCapitalization: TextCapitalization.words,
+                  decoration: InputDecoration(
+                    labelText: 'Your name',
+                    hintText: 'e.g. Aline Uwase',
+                    prefixIcon: const Icon(Icons.person_outline),
+                    filled: true,
+                    fillColor: Colors.white,
+                    border: OutlineInputBorder(
+                      borderRadius: BorderRadius.circular(14),
+                      borderSide: BorderSide.none,
+                    ),
+                    enabledBorder: OutlineInputBorder(
+                      borderRadius: BorderRadius.circular(14),
+                      borderSide: BorderSide.none,
+                    ),
+                  ),
+                ),
               ),
-            )
-                : ListView.builder(
-              padding: const EdgeInsets.fromLTRB(16, 8, 16, 24),
-              itemCount: candidates.length,
-              itemBuilder: (context, index) {
-                final c = candidates[index];
-                return _CandidateCard(
-                  candidate: c,
-                  total: totalVotes,
-                  onVote: () => vote(c),
-                );
-              },
-            ),
-          ),
-        ],
+              Expanded(
+                child: candidates.isEmpty
+                    ? const Center(
+                  child: Text(
+                    'No candidates yet',
+                    style: TextStyle(fontSize: 16, color: Colors.grey),
+                  ),
+                )
+                    : ListView.builder(
+                  padding: const EdgeInsets.fromLTRB(16, 8, 16, 24),
+                  itemCount: candidates.length,
+                  itemBuilder: (context, index) {
+                    final c = candidates[index];
+                    return _CandidateCard(
+                      candidate: c,
+                      total: totalVotes,
+                      onVote: () => vote(c),
+                    );
+                  },
+                ),
+              ),
+            ],
+          );
+        },
       ),
     );
   }
@@ -472,8 +464,7 @@ class _CandidateCard extends StatelessWidget {
 }
 
 class CandidatesScreen extends StatefulWidget {
-  const CandidatesScreen({super.key, required this.candidates});
-  final List<Candidate> candidates;
+  const CandidatesScreen({super.key});
 
   @override
   State<CandidatesScreen> createState() => _CandidatesScreenState();
@@ -488,40 +479,30 @@ class _CandidatesScreenState extends State<CandidatesScreen> {
     super.dispose();
   }
 
-  void addCandidate() {
+  void addCandidate() async {
     final cleaned = cleanName(nameController.text);
     if (cleaned.isEmpty) {
       _toast('Candidate name cannot be empty', Colors.red.shade600);
       return;
     }
 
-    final exists = widget.candidates.any(
-          (c) => c.name.toLowerCase() == cleaned.toLowerCase(),
-    );
-    if (exists) {
+    final existing = await myCandidates().where('name', isEqualTo: cleaned).get();
+    if (existing.docs.isNotEmpty) {
       _toast('$cleaned is already a candidate', Colors.orange.shade700);
       return;
     }
 
-    setState(() {
-      widget.candidates.add(Candidate(cleaned));
-    });
+    await myCandidates().add({'name': cleaned, 'votes': 0});
     nameController.clear();
     _toast('Added $cleaned', Colors.green.shade600);
   }
 
-  void removeCandidate(Candidate c) {
-    if (c.votes > 0) {
-      _toast(
-        '${c.name} has votes and cannot be removed',
-        Colors.orange.shade700,
-      );
+  void removeCandidate(String id, int votes) async {
+    if (votes > 0) {
+      _toast('This candidate has votes and cannot be removed', Colors.orange.shade700);
       return;
     }
-    setState(() {
-      widget.candidates.remove(c);
-    });
-    _toast('Removed ${c.name}', Colors.grey.shade700);
+    await myCandidates().doc(id).delete();
   }
 
   void _toast(String message, Color color) {
@@ -544,292 +525,251 @@ class _CandidatesScreenState extends State<CandidatesScreen> {
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(title: const Text('Candidates')),
-      body: Column(
-        children: [
-          Padding(
-            padding: const EdgeInsets.all(16),
-            child: Row(
-              children: [
-                Expanded(
-                  child: TextField(
-                    controller: nameController,
-                    textCapitalization: TextCapitalization.words,
-                    decoration: InputDecoration(
-                      labelText: 'New candidate',
-                      prefixIcon: const Icon(Icons.person_add_alt),
-                      filled: true,
-                      fillColor: Colors.white,
-                      border: OutlineInputBorder(
-                        borderRadius: BorderRadius.circular(14),
-                        borderSide: BorderSide.none,
+      body: StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
+        stream: myCandidates().snapshots(),
+        builder: (context, snapshot) {
+          if (!snapshot.hasData) return const Center(child: CircularProgressIndicator());
+          final candidates = snapshot.data!.docs.map(Candidate.fromDoc).toList();
+
+          return Column(
+            children: [
+              Padding(
+                padding: const EdgeInsets.all(16),
+                child: Row(
+                  children: [
+                    Expanded(
+                      child: TextField(
+                        controller: nameController,
+                        textCapitalization: TextCapitalization.words,
+                        decoration: InputDecoration(
+                          labelText: 'New candidate',
+                          prefixIcon: const Icon(Icons.person_add_alt),
+                          filled: true,
+                          fillColor: Colors.white,
+                          border: OutlineInputBorder(
+                            borderRadius: BorderRadius.circular(14),
+                            borderSide: BorderSide.none,
+                          ),
+                        ),
+                        onSubmitted: (_) => addCandidate(),
                       ),
                     ),
-                    onSubmitted: (_) => addCandidate(),
-                  ),
-                ),
-                const SizedBox(width: 10),
-                FilledButton(
-                  onPressed: addCandidate,
-                  style: FilledButton.styleFrom(
-                    padding: const EdgeInsets.symmetric(
-                      horizontal: 22,
-                      vertical: 18,
+                    const SizedBox(width: 10),
+                    FilledButton(
+                      onPressed: addCandidate,
+                      style: FilledButton.styleFrom(
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 22,
+                          vertical: 18,
+                        ),
+                        shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(14),
+                        ),
+                      ),
+                      child: const Text('Add'),
                     ),
-                    shape: RoundedRectangleBorder(
-                      borderRadius: BorderRadius.circular(14),
-                    ),
-                  ),
-                  child: const Text('Add'),
+                  ],
                 ),
-              ],
-            ),
-          ),
-          const Divider(height: 1),
-          Expanded(
-            child: widget.candidates.isEmpty
-                ? const Center(
-              child: Text(
-                'No candidates yet',
-                style: TextStyle(fontSize: 16, color: Colors.grey),
               ),
-            )
-                : ListView.builder(
-              padding: const EdgeInsets.fromLTRB(16, 12, 16, 24),
-              itemCount: widget.candidates.length,
-              itemBuilder: (context, index) {
-                final c = widget.candidates[index];
-                return Container(
-                  margin: const EdgeInsets.symmetric(vertical: 5),
-                  decoration: BoxDecoration(
-                    color: Colors.white,
-                    borderRadius: BorderRadius.circular(14),
-                    boxShadow: [
-                      BoxShadow(
-                        color: Colors.black.withValues(alpha: 0.03),
-                        blurRadius: 8,
-                        offset: const Offset(0, 2),
-                      ),
-                    ],
+              const Divider(height: 1),
+              Expanded(
+                child: candidates.isEmpty
+                    ? const Center(
+                  child: Text(
+                    'No candidates yet',
+                    style: TextStyle(fontSize: 16, color: Colors.grey),
                   ),
-                  child: ListTile(
-                    contentPadding: const EdgeInsets.symmetric(
-                      horizontal: 16,
-                      vertical: 6,
-                    ),
-                    leading: CircleAvatar(
-                      backgroundColor:
-                      Theme.of(context).colorScheme.primary,
-                      child: Text(
-                        c.name[0].toUpperCase(),
-                        style: const TextStyle(color: Colors.white),
+                )
+                    : ListView.builder(
+                  padding: const EdgeInsets.fromLTRB(16, 12, 16, 24),
+                  itemCount: candidates.length,
+                  itemBuilder: (context, index) {
+                    final c = candidates[index];
+                    return Container(
+                      margin: const EdgeInsets.symmetric(vertical: 5),
+                      decoration: BoxDecoration(
+                        color: Colors.white,
+                        borderRadius: BorderRadius.circular(14),
+                        boxShadow: [
+                          BoxShadow(
+                            color: Colors.black.withValues(alpha: 0.03),
+                            blurRadius: 8,
+                            offset: const Offset(0, 2),
+                          ),
+                        ],
                       ),
-                    ),
-                    title: Text(
-                      c.name,
-                      style:
-                      const TextStyle(fontWeight: FontWeight.w600),
-                    ),
-                    subtitle: Text('${c.votes} vote(s)'),
-                    trailing: IconButton(
-                      icon: Icon(
-                        Icons.delete_outline,
-                        color: c.votes > 0
-                            ? Colors.grey.shade400
-                            : Colors.red.shade400,
+                      child: ListTile(
+                        contentPadding: const EdgeInsets.symmetric(
+                          horizontal: 16,
+                          vertical: 6,
+                        ),
+                        leading: CircleAvatar(
+                          backgroundColor: Theme.of(context).colorScheme.primary,
+                          child: Text(
+                            c.name[0].toUpperCase(),
+                            style: const TextStyle(color: Colors.white),
+                          ),
+                        ),
+                        title: Text(
+                          c.name,
+                          style: const TextStyle(fontWeight: FontWeight.w600),
+                        ),
+                        subtitle: Text('${c.votes} vote(s)'),
+                        trailing: IconButton(
+                          icon: Icon(
+                            Icons.delete_outline,
+                            color: c.votes > 0 ? Colors.grey.shade400 : Colors.red.shade400,
+                          ),
+                          onPressed: () => removeCandidate(c.id, c.votes),
+                        ),
                       ),
-                      onPressed: () => removeCandidate(c),
-                    ),
-                  ),
-                );
-              },
-            ),
-          ),
-        ],
+                    );
+                  },
+                ),
+              ),
+            ],
+          );
+        },
       ),
     );
   }
 }
 
-class ResultsScreen extends StatefulWidget {
-  const ResultsScreen({super.key, required this.candidates, required this.onReset});
-  final List<Candidate> candidates;
-  final VoidCallback onReset;
-
-  @override
-  State<ResultsScreen> createState() => _ResultsScreenState();
-}
-
-class _ResultsScreenState extends State<ResultsScreen> {
-  void resetVotes() {
-    showDialog<void>(
-      context: context,
-      builder: (context) => AlertDialog(
-        shape: RoundedRectangleBorder(
-          borderRadius: BorderRadius.circular(20),
-        ),
-        title: const Text('Reset all votes?'),
-        content: const Text('This clears every vote and every voter.'),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(context),
-            child: const Text('Cancel'),
-          ),
-          FilledButton(
-            style: FilledButton.styleFrom(backgroundColor: Colors.red),
-            onPressed: () {
-              setState(() {
-                for (var c in widget.candidates) {
-                  c.votes = 0;
-                }
-              });
-              widget.onReset();
-              Navigator.pop(context);
-            },
-            child: const Text('Reset'),
-          ),
-        ],
-      ),
-    );
-  }
+class ResultsScreen extends StatelessWidget {
+  const ResultsScreen({super.key});
 
   @override
   Widget build(BuildContext context) {
-    final total = widget.candidates.fold<int>(0, (sum, c) => sum + c.votes);
-    final sorted = [...widget.candidates]
-      ..sort((a, b) => b.votes.compareTo(a.votes));
-
-    Widget banner;
-    if (total == 0) {
-      banner = const _Banner(
-        colors: [Color(0xFF6B7280), Color(0xFF4B5563)],
-        icon: Icons.hourglass_empty,
-        title: 'No votes yet',
-        subtitle: 'Cast a vote to see results',
-      );
-    } else {
-      final top = sorted.first.votes;
-      final winners = sorted.where((c) => c.votes == top).toList();
-      if (winners.length > 1) {
-        final names = winners.map((c) => c.name).join(' and ');
-        banner = _Banner(
-          colors: const [Color(0xFFF59E0B), Color(0xFFEA580C)],
-          icon: Icons.balance,
-          title: 'Tie',
-          subtitle: '$names · $top votes each',
-        );
-      } else {
-        banner = _Banner(
-          colors: const [Color(0xFF10B981), Color(0xFF059669)],
-          icon: Icons.emoji_events,
-          title: 'Winner: ${winners.first.name}',
-          subtitle: '$top vote${top == 1 ? '' : 's'}',
-        );
-      }
-    }
-
     return Scaffold(
-      appBar: AppBar(
-        title: const Text('Results'),
-        actions: [
-          IconButton(
-            icon: const Icon(Icons.refresh),
-            tooltip: 'Reset all votes',
-            onPressed: total == 0 ? null : resetVotes,
-          ),
-        ],
-      ),
-      body: Padding(
-        padding: const EdgeInsets.all(16),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.stretch,
-          children: [
-            banner,
-            const SizedBox(height: 16),
-            Expanded(
-              child: sorted.isEmpty
-                  ? const Center(
-                child: Text(
-                  'No candidates yet',
-                  style: TextStyle(fontSize: 16, color: Colors.grey),
-                ),
-              )
-                  : ListView.builder(
-                itemCount: sorted.length,
-                itemBuilder: (context, index) {
-                  final c = sorted[index];
-                  final pct = total == 0 ? 0.0 : c.votes / total;
-                  final position = index + 1;
-                  return Container(
-                    margin: const EdgeInsets.symmetric(vertical: 5),
-                    padding: const EdgeInsets.all(14),
-                    decoration: BoxDecoration(
-                      color: Colors.white,
-                      borderRadius: BorderRadius.circular(16),
-                      boxShadow: [
-                        BoxShadow(
-                          color: Colors.black.withValues(alpha: 0.04),
-                          blurRadius: 10,
-                          offset: const Offset(0, 4),
+      appBar: AppBar(title: const Text('Results')),
+      body: StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
+        stream: myCandidates().snapshots(),
+        builder: (context, snapshot) {
+          if (!snapshot.hasData) return const Center(child: CircularProgressIndicator());
+
+          final candidates = snapshot.data!.docs.map(Candidate.fromDoc).toList();
+          final total = candidates.fold<int>(0, (sum, c) => sum + c.votes);
+          final sorted = [...candidates]..sort((a, b) => b.votes.compareTo(a.votes));
+
+          if (sorted.isEmpty) return const Center(child: Text('No candidates yet'));
+
+          // Banner logic
+          Widget banner;
+          if (total == 0) {
+            banner = const _Banner(
+              colors: [Color(0xFF6B7280), Color(0xFF4B5563)],
+              icon: Icons.hourglass_empty,
+              title: 'No votes yet',
+              subtitle: 'Cast a vote to see results',
+            );
+          } else {
+            final top = sorted.first.votes;
+            final winners = sorted.where((c) => c.votes == top).toList();
+            if (winners.length > 1) {
+              final names = winners.map((c) => c.name).join(' and ');
+              banner = _Banner(
+                colors: const [Color(0xFFF59E0B), Color(0xFFEA580C)],
+                icon: Icons.balance,
+                title: 'Tie',
+                subtitle: '$names · $top votes each',
+              );
+            } else {
+              banner = _Banner(
+                colors: const [Color(0xFF10B981), Color(0xFF059669)],
+                icon: Icons.emoji_events,
+                title: 'Winner: ${winners.first.name}',
+                subtitle: '$top vote${top == 1 ? '' : 's'}',
+              );
+            }
+          }
+
+          return Padding(
+            padding: const EdgeInsets.all(16),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                banner,
+                const SizedBox(height: 16),
+                Expanded(
+                  child: ListView.builder(
+                    itemCount: sorted.length,
+                    itemBuilder: (context, index) {
+                      final c = sorted[index];
+                      final pct = total == 0 ? 0.0 : c.votes / total;
+                      final position = index + 1;
+                      return Container(
+                        margin: const EdgeInsets.symmetric(vertical: 5),
+                        padding: const EdgeInsets.all(14),
+                        decoration: BoxDecoration(
+                          color: Colors.white,
+                          borderRadius: BorderRadius.circular(16),
+                          boxShadow: [
+                            BoxShadow(
+                              color: Colors.black.withValues(alpha: 0.04),
+                              blurRadius: 10,
+                              offset: const Offset(0, 4),
+                            ),
+                          ],
                         ),
-                      ],
-                    ),
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Row(
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
                           children: [
-                            CircleAvatar(
-                              radius: 14,
-                              backgroundColor: _medalColor(position),
-                              child: Text(
-                                '$position',
-                                style: const TextStyle(
-                                  color: Colors.white,
-                                  fontSize: 12,
-                                  fontWeight: FontWeight.w700,
+                            Row(
+                              children: [
+                                CircleAvatar(
+                                  radius: 14,
+                                  backgroundColor: _medalColor(position),
+                                  child: Text(
+                                    '$position',
+                                    style: const TextStyle(
+                                      color: Colors.white,
+                                      fontSize: 12,
+                                      fontWeight: FontWeight.w700,
+                                    ),
+                                  ),
                                 ),
-                              ),
-                            ),
-                            const SizedBox(width: 10),
-                            Expanded(
-                              child: Text(
-                                c.name,
-                                style: const TextStyle(
-                                  fontSize: 16,
-                                  fontWeight: FontWeight.w600,
+                                const SizedBox(width: 10),
+                                Expanded(
+                                  child: Text(
+                                    c.name,
+                                    style: const TextStyle(
+                                      fontSize: 16,
+                                      fontWeight: FontWeight.w600,
+                                    ),
+                                  ),
                                 ),
-                              ),
+                                Text(
+                                  '${c.votes} (${(pct * 100).toStringAsFixed(1)}%)',
+                                  style: TextStyle(
+                                    fontSize: 13,
+                                    fontWeight: FontWeight.w600,
+                                    color: Colors.grey.shade700,
+                                  ),
+                                ),
+                              ],
                             ),
-                            Text(
-                              '${c.votes} (${(pct * 100).toStringAsFixed(1)}%)',
-                              style: TextStyle(
-                                fontSize: 13,
-                                fontWeight: FontWeight.w600,
-                                color: Colors.grey.shade700,
+                            const SizedBox(height: 10),
+                            ClipRRect(
+                              borderRadius: BorderRadius.circular(8),
+                              child: LinearProgressIndicator(
+                                value: pct,
+                                minHeight: 10,
+                                backgroundColor: Colors.grey.shade200,
+                                valueColor: AlwaysStoppedAnimation(
+                                  _medalColor(position),
+                                ),
                               ),
                             ),
                           ],
                         ),
-                        const SizedBox(height: 10),
-                        ClipRRect(
-                          borderRadius: BorderRadius.circular(8),
-                          child: LinearProgressIndicator(
-                            value: pct,
-                            minHeight: 10,
-                            backgroundColor: Colors.grey.shade200,
-                            valueColor: AlwaysStoppedAnimation(
-                              _medalColor(position),
-                            ),
-                          ),
-                        ),
-                      ],
-                    ),
-                  );
-                },
-              ),
+                      );
+                    },
+                  ),
+                ),
+              ],
             ),
-          ],
-        ),
+          );
+        },
       ),
     );
   }

@@ -1,10 +1,10 @@
 # Class Election
 
-A beautiful Class Election app. My data is now saved on the phone with shared_preferences, so nothing is lost when the app closes, and it shows the live Kigali weather from the Open-Meteo API.
+A beautiful Class Election app that tracks votes. It signs users in with Firebase Authentication, and each user's data is saved in Cloud Firestore under their own id, so two accounts never see each other's data, and every change appears live.
 
 ## Screenshots
 
-![Before closing](screenshots/Before.png)
-![After running again](screenshots/After.png)
-![Live data from an API](screenshots/api.png)
-![No internet](screenshots/no-internet.png)
+![Login](screenshots/login.png)
+![My data in Firestore](screenshots/console.PNG)
+![Live update](screenshots/live.png)
+![Second account sees nothing of mine](screenshots/denied.png)
