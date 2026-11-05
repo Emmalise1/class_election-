@@ -15,7 +15,7 @@ A beautiful app to run a class election live. Every voter can log in, cast their
 ## Screenshots
 | Login | Voting                         | Results                          |
 |---|--------------------------------|----------------------------------|
-| ![Login](screenshots/login.png) | ![Voting](screenshots/new.png) | ![Results](screenshots/new1.png) |
+| ![Login](screenshots/login.png) | ![Voting](screenshots/new.png) | ![Results](screenshots/new2.png) |
 
 ## How it's built
 - Flutter, with Provider for state management
