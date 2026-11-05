@@ -13,9 +13,9 @@ A beautiful app to run a class election live. Every voter can log in, cast their
 - Weather API integration.
 
 ## Screenshots
-| Login | Voting                            | Results                           |
-|---|-----------------------------------|-----------------------------------|
-| ![Login](screenshots/login.png) | ![Voting](screenshots/Before.png) | ![Results](screenshots/After.png) |
+| Login | Voting                         | Results                          |
+|---|--------------------------------|----------------------------------|
+| ![Login](screenshots/login.png) | ![Voting](screenshots/new.png) | ![Results](screenshots/new1.png) |
 
 ## How it's built
 - Flutter, with Provider for state management
