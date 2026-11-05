@@ -1,10 +1,28 @@
 # Class Election
 
-A beautiful Class Election app that tracks votes. It signs users in with Firebase Authentication, and each user's data is saved in Cloud Firestore under their own id, so two accounts never see each other's data, and every change appears live.
+A beautiful app to run a class election live. Every voter can log in, cast their vote, and see the results update instantly on every phone.
+
+## Download
+[Download the latest APK](https://github.com/Emmalise1/class_election-/releases/latest) (for Android phones)
+
+## Features
+- Create an account and log in securely.
+- Add new candidates with profile photos.
+- Cast a vote (one vote per person).
+- Live results with percentages, winner detection, and tie handling.
+- Weather API integration.
 
 ## Screenshots
+| Login | Voting | Results |
+|---|---|---|
+| ![Login](screenshots/login.png) | ![Voting](screenshots/live.png) | ![Results](screenshots/denied.png) |
 
-![Login](screenshots/login.png)
-![My data in Firestore](screenshots/console.PNG)
-![Live update](screenshots/live.png)
-![Second account sees nothing of mine](screenshots/denied.png)
+## How it's built
+- Flutter, with Provider for state management
+- Firebase Authentication and Cloud Firestore
+- Cloudinary for photo uploads
+- Open-Meteo API
+- Four layers: models, repositories, state, screens
+
+## Author
+Your Name: [GitHub](https://github.com/Emmalise1)

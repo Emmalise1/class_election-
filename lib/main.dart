@@ -1,9 +1,14 @@
-import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:firebase_core/firebase_core.dart';
 import 'package:flutter/material.dart';
+import 'package:provider/provider.dart';
+import 'dart:io';
+import 'package:image_picker/image_picker.dart';
+
+import 'models/candidate.dart';
+import 'state/candidate_state.dart';
+import 'screens/auth_gate.dart';
 import 'weather.dart';
-import 'auth_gate.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -17,41 +22,6 @@ String cleanName(String raw) {
       .where((w) => w.isNotEmpty)
       .map((w) => w[0].toUpperCase() + w.substring(1).toLowerCase())
       .join(' ');
-}
-
-class Candidate {
-  Candidate({this.id = '', required this.name, this.votes = 0});
-  final String id;
-  final String name;
-  final int votes;
-
-  Map<String, dynamic> toMap() => {'name': name, 'votes': votes};
-
-  factory Candidate.fromDoc(DocumentSnapshot<Map<String, dynamic>> doc) {
-    final data = doc.data()!;
-    return Candidate(
-      id: doc.id,
-      name: data['name'] as String,
-      votes: (data['votes'] as num).toInt(),
-    );
-  }
-}
-
-CollectionReference<Map<String, dynamic>> myCandidates() {
-  final uid = FirebaseAuth.instance.currentUser!.uid;
-  return FirebaseFirestore.instance
-      .collection('users')
-      .doc(uid)
-      .collection('candidates');
-}
-
-// NEW: This tracks who has voted so they can't vote twice
-CollectionReference<Map<String, dynamic>> myVoters() {
-  final uid = FirebaseAuth.instance.currentUser!.uid;
-  return FirebaseFirestore.instance
-      .collection('users')
-      .doc(uid)
-      .collection('voters');
 }
 
 class ElectionApp extends StatelessWidget {
@@ -99,7 +69,6 @@ class VoteScreen extends StatefulWidget {
 class _VoteScreenState extends State<VoteScreen> {
   final voterController = TextEditingController();
 
-  // API State
   WeatherData? weather;
   bool loadingWeather = true;
   bool weatherError = false;
@@ -143,20 +112,8 @@ class _VoteScreenState extends State<VoteScreen> {
       return;
     }
 
-    // 1. Check if the voter already exists in Firestore
-    final existingVoter = await myVoters().where('name', isEqualTo: cleaned.toLowerCase()).get();
-    if (existingVoter.docs.isNotEmpty) {
-      _toast('$cleaned has already voted', Colors.orange.shade700);
-      return;
-    }
-
-    // 2. Record the voter
-    await myVoters().add({'name': cleaned.toLowerCase()});
-
-    // 3. Increment the vote
-    await myCandidates().doc(c.id).update({
-      'votes': FieldValue.increment(1),
-    });
+    final state = context.read<CandidateState>();
+    await state.vote(c.id);
 
     _toast('$cleaned voted for ${c.name}', Colors.green.shade600);
     voterController.clear();
@@ -180,6 +137,10 @@ class _VoteScreenState extends State<VoteScreen> {
 
   @override
   Widget build(BuildContext context) {
+    final state = context.watch<CandidateState>();
+    final candidates = state.visible;
+    final totalVotes = state.totalVotes;
+
     return Scaffold(
       appBar: AppBar(
         title: const Text('Class Election'),
@@ -207,123 +168,128 @@ class _VoteScreenState extends State<VoteScreen> {
           ),
         ],
       ),
-      body: StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
-        stream: myCandidates().snapshots(),
-        builder: (context, snapshot) {
-          if (snapshot.hasError) {
-            return Center(child: Text('Error: ${snapshot.error}'));
-          }
-          if (!snapshot.hasData) {
-            return const Center(child: CircularProgressIndicator());
-          }
-
-          final candidates = snapshot.data!.docs.map(Candidate.fromDoc).toList();
-          final totalVotes = candidates.fold<int>(0, (s, c) => s + c.votes);
-
-          return Column(
-            children: [
-              Container(
-                width: double.infinity,
-                margin: const EdgeInsets.fromLTRB(16, 16, 16, 8),
-                padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 18),
-                decoration: BoxDecoration(
-                  gradient: const LinearGradient(
-                    colors: [Color(0xFF4F46E5), Color(0xFF7C3AED)],
-                    begin: Alignment.topLeft,
-                    end: Alignment.bottomRight,
-                  ),
-                  borderRadius: BorderRadius.circular(20),
-                  boxShadow: [
-                    BoxShadow(
-                      color: const Color(0xFF4F46E5).withValues(alpha: 0.25),
-                      blurRadius: 16,
-                      offset: const Offset(0, 6),
-                    ),
-                  ],
+      body: state.loading
+          ? const Center(child: CircularProgressIndicator())
+          : state.error != null
+          ? Center(child: Text(state.error!))
+          : Column(
+        children: [
+          Container(
+            width: double.infinity,
+            margin: const EdgeInsets.fromLTRB(16, 16, 16, 8),
+            padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 18),
+            decoration: BoxDecoration(
+              gradient: const LinearGradient(
+                colors: [Color(0xFF4F46E5), Color(0xFF7C3AED)],
+                begin: Alignment.topLeft,
+                end: Alignment.bottomRight,
+              ),
+              borderRadius: BorderRadius.circular(20),
+              boxShadow: [
+                BoxShadow(
+                  color: const Color(0xFF4F46E5).withValues(alpha: 0.25),
+                  blurRadius: 16,
+                  offset: const Offset(0, 6),
                 ),
-                child: loadingWeather
-                    ? const Center(child: CircularProgressIndicator(color: Colors.white))
-                    : weatherError
-                    ? Column(
+              ],
+            ),
+            child: loadingWeather
+                ? const Center(child: CircularProgressIndicator(color: Colors.white))
+                : weatherError
+                ? Column(
+              children: [
+                const Icon(Icons.wifi_off, color: Colors.white),
+                const SizedBox(height: 4),
+                const Text('Could not load live weather', style: TextStyle(color: Colors.white)),
+                const SizedBox(height: 4),
+                TextButton(
+                  onPressed: loadWeather,
+                  child: const Text('Retry', style: TextStyle(color: Colors.white, decoration: TextDecoration.underline)),
+                ),
+              ],
+            )
+                : Row(
+              children: [
+                Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    const Icon(Icons.wifi_off, color: Colors.white),
-                    const SizedBox(height: 4),
-                    const Text('Could not load live weather', style: TextStyle(color: Colors.white)),
-                    const SizedBox(height: 4),
-                    TextButton(
-                      onPressed: loadWeather,
-                      child: const Text('Retry', style: TextStyle(color: Colors.white, decoration: TextDecoration.underline)),
-                    ),
-                  ],
-                )
-                    : Row(
-                  children: [
-                    Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        const Text('Live API', style: TextStyle(color: Colors.white70, fontSize: 12)),
-                        Text('Kigali: ${weather!.temperature.round()}°C', style: const TextStyle(color: Colors.white, fontSize: 16, fontWeight: FontWeight.w700)),
-                      ],
-                    ),
-                    const SizedBox(width: 20),
-                    Expanded(child: _stat('Total votes', '$totalVotes')),
-                    Container(
-                      width: 1,
-                      height: 40,
-                      color: Colors.white.withValues(alpha: 0.3),
-                    ),
-                    Expanded(
-                      child: _stat('Candidates', '${candidates.length}'),
-                    ),
+                    const Text('Live API', style: TextStyle(color: Colors.white70, fontSize: 12)),
+                    Text('Kigali: ${weather!.temperature.round()}°C', style: const TextStyle(color: Colors.white, fontSize: 16, fontWeight: FontWeight.w700)),
                   ],
                 ),
-              ),
-              Padding(
-                padding: const EdgeInsets.fromLTRB(16, 8, 16, 4),
-                child: TextField(
-                  controller: voterController,
-                  textCapitalization: TextCapitalization.words,
-                  decoration: InputDecoration(
-                    labelText: 'Your name',
-                    hintText: 'e.g. Aline Uwase',
-                    prefixIcon: const Icon(Icons.person_outline),
-                    filled: true,
-                    fillColor: Colors.white,
-                    border: OutlineInputBorder(
-                      borderRadius: BorderRadius.circular(14),
-                      borderSide: BorderSide.none,
-                    ),
-                    enabledBorder: OutlineInputBorder(
-                      borderRadius: BorderRadius.circular(14),
-                      borderSide: BorderSide.none,
-                    ),
-                  ),
+                const SizedBox(width: 20),
+                Expanded(child: _stat('Total votes', '$totalVotes')),
+                Container(
+                  width: 1,
+                  height: 40,
+                  color: Colors.white.withValues(alpha: 0.3),
+                ),
+                Expanded(
+                  child: _stat('Candidates', '${candidates.length}'),
+                ),
+              ],
+            ),
+          ),
+          Padding(
+            padding: const EdgeInsets.fromLTRB(16, 8, 16, 4),
+            child: TextField(
+              controller: voterController,
+              textCapitalization: TextCapitalization.words,
+              decoration: InputDecoration(
+                labelText: 'Your name',
+                hintText: 'e.g. Aline Uwase',
+                prefixIcon: const Icon(Icons.person_outline),
+                filled: true,
+                fillColor: Colors.white,
+                border: OutlineInputBorder(
+                  borderRadius: BorderRadius.circular(14),
+                  borderSide: BorderSide.none,
+                ),
+                enabledBorder: OutlineInputBorder(
+                  borderRadius: BorderRadius.circular(14),
+                  borderSide: BorderSide.none,
                 ),
               ),
-              Expanded(
-                child: candidates.isEmpty
-                    ? const Center(
-                  child: Text(
-                    'No candidates yet',
-                    style: TextStyle(fontSize: 16, color: Colors.grey),
+            ),
+          ),
+          // Filter Chips
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+            child: Row(
+              children: ['all', 'voted'].map((f) {
+                return Padding(
+                  padding: const EdgeInsets.only(right: 8),
+                  child: ChoiceChip(
+                    label: Text(f.toUpperCase()),
+                    selected: state.filter == f,
+                    onSelected: (_) => context.read<CandidateState>().setFilter(f),
                   ),
-                )
-                    : ListView.builder(
-                  padding: const EdgeInsets.fromLTRB(16, 8, 16, 24),
-                  itemCount: candidates.length,
-                  itemBuilder: (context, index) {
-                    final c = candidates[index];
-                    return _CandidateCard(
-                      candidate: c,
-                      total: totalVotes,
-                      onVote: () => vote(c),
-                    );
-                  },
-                ),
+                );
+              }).toList(),
+            ),
+          ),
+          Expanded(
+            child: candidates.isEmpty
+                ? const Center(
+              child: Text(
+                'No candidates yet',
+                style: TextStyle(fontSize: 16, color: Colors.grey),
               ),
-            ],
-          );
-        },
+            )
+                : ListView.builder(
+              padding: const EdgeInsets.fromLTRB(16, 8, 16, 24),
+              itemCount: candidates.length,
+              itemBuilder: (context, index) {
+                final c = candidates[index];
+                return _CandidateCard(
+                  candidate: c,
+                  total: totalVotes,
+                  onVote: () => vote(c),
+                );
+              },
+            ),
+          ),
+        ],
       ),
     );
   }
@@ -387,14 +353,17 @@ class _CandidateCard extends StatelessWidget {
           CircleAvatar(
             radius: 24,
             backgroundColor: color.withValues(alpha: 0.15),
-            child: Text(
+            backgroundImage: candidate.photoUrl != null ? NetworkImage(candidate.photoUrl!) : null,
+            child: candidate.photoUrl == null
+                ? Text(
               candidate.name.isNotEmpty ? candidate.name[0].toUpperCase() : '?',
               style: TextStyle(
                 color: color,
                 fontWeight: FontWeight.w700,
                 fontSize: 20,
               ),
-            ),
+            )
+                : null,
           ),
           const SizedBox(width: 14),
           Expanded(
@@ -472,11 +441,24 @@ class CandidatesScreen extends StatefulWidget {
 
 class _CandidatesScreenState extends State<CandidatesScreen> {
   final nameController = TextEditingController();
+  bool _isSaving = false;
+  File? _pickedPhoto;
 
   @override
   void dispose() {
     nameController.dispose();
     super.dispose();
+  }
+
+  Future<void> _pickPhoto() async {
+    final picked = await ImagePicker().pickImage(
+        source: ImageSource.gallery,
+        maxWidth: 800,
+        imageQuality: 70
+    );
+    if (picked != null) {
+      setState(() => _pickedPhoto = File(picked.path));
+    }
   }
 
   void addCandidate() async {
@@ -486,15 +468,32 @@ class _CandidatesScreenState extends State<CandidatesScreen> {
       return;
     }
 
-    final existing = await myCandidates().where('name', isEqualTo: cleaned).get();
-    if (existing.docs.isNotEmpty) {
+    final state = context.read<CandidateState>();
+    if (state.candidates.any((c) => c.name.toLowerCase() == cleaned.toLowerCase())) {
       _toast('$cleaned is already a candidate', Colors.orange.shade700);
       return;
     }
 
-    await myCandidates().add({'name': cleaned, 'votes': 0});
-    nameController.clear();
-    _toast('Added $cleaned', Colors.green.shade600);
+    setState(() => _isSaving = true);
+
+    try {
+      String? photoUrl;
+      // 1. Upload the photo if one was picked
+      if (_pickedPhoto != null) {
+        photoUrl = await state.uploadPhoto(_pickedPhoto!);
+      }
+
+      // 2. Save the candidate with the photo link
+      await state.add(cleaned, photoUrl);
+
+      nameController.clear();
+      setState(() => _pickedPhoto = null);
+      _toast('Added $cleaned', Colors.green.shade600);
+    } catch (e) {
+      _toast('Error: $e', Colors.red.shade600);
+    } finally {
+      setState(() => _isSaving = false);
+    }
   }
 
   void removeCandidate(String id, int votes) async {
@@ -502,7 +501,7 @@ class _CandidatesScreenState extends State<CandidatesScreen> {
       _toast('This candidate has votes and cannot be removed', Colors.orange.shade700);
       return;
     }
-    await myCandidates().doc(id).delete();
+    await context.read<CandidateState>().delete(id);
   }
 
   void _toast(String message, Color color) {
@@ -523,113 +522,129 @@ class _CandidatesScreenState extends State<CandidatesScreen> {
 
   @override
   Widget build(BuildContext context) {
+    final candidates = context.watch<CandidateState>().candidates;
+
     return Scaffold(
       appBar: AppBar(title: const Text('Candidates')),
-      body: StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
-        stream: myCandidates().snapshots(),
-        builder: (context, snapshot) {
-          if (!snapshot.hasData) return const Center(child: CircularProgressIndicator());
-          final candidates = snapshot.data!.docs.map(Candidate.fromDoc).toList();
-
-          return Column(
-            children: [
-              Padding(
-                padding: const EdgeInsets.all(16),
-                child: Row(
-                  children: [
-                    Expanded(
-                      child: TextField(
-                        controller: nameController,
-                        textCapitalization: TextCapitalization.words,
-                        decoration: InputDecoration(
-                          labelText: 'New candidate',
-                          prefixIcon: const Icon(Icons.person_add_alt),
-                          filled: true,
-                          fillColor: Colors.white,
-                          border: OutlineInputBorder(
-                            borderRadius: BorderRadius.circular(14),
-                            borderSide: BorderSide.none,
-                          ),
-                        ),
-                        onSubmitted: (_) => addCandidate(),
-                      ),
-                    ),
-                    const SizedBox(width: 10),
-                    FilledButton(
-                      onPressed: addCandidate,
-                      style: FilledButton.styleFrom(
-                        padding: const EdgeInsets.symmetric(
-                          horizontal: 22,
-                          vertical: 18,
-                        ),
-                        shape: RoundedRectangleBorder(
-                          borderRadius: BorderRadius.circular(14),
-                        ),
-                      ),
-                      child: const Text('Add'),
-                    ),
-                  ],
-                ),
-              ),
-              const Divider(height: 1),
-              Expanded(
-                child: candidates.isEmpty
-                    ? const Center(
-                  child: Text(
-                    'No candidates yet',
-                    style: TextStyle(fontSize: 16, color: Colors.grey),
-                  ),
-                )
-                    : ListView.builder(
-                  padding: const EdgeInsets.fromLTRB(16, 12, 16, 24),
-                  itemCount: candidates.length,
-                  itemBuilder: (context, index) {
-                    final c = candidates[index];
-                    return Container(
-                      margin: const EdgeInsets.symmetric(vertical: 5),
-                      decoration: BoxDecoration(
-                        color: Colors.white,
+      body: Column(
+        children: [
+          Padding(
+            padding: const EdgeInsets.all(16),
+            child: Row(
+              children: [
+                Expanded(
+                  child: TextField(
+                    controller: nameController,
+                    textCapitalization: TextCapitalization.words,
+                    decoration: InputDecoration(
+                      labelText: 'New candidate',
+                      prefixIcon: const Icon(Icons.person_add_alt),
+                      filled: true,
+                      fillColor: Colors.white,
+                      border: OutlineInputBorder(
                         borderRadius: BorderRadius.circular(14),
-                        boxShadow: [
-                          BoxShadow(
-                            color: Colors.black.withValues(alpha: 0.03),
-                            blurRadius: 8,
-                            offset: const Offset(0, 2),
-                          ),
-                        ],
+                        borderSide: BorderSide.none,
                       ),
-                      child: ListTile(
-                        contentPadding: const EdgeInsets.symmetric(
-                          horizontal: 16,
-                          vertical: 6,
-                        ),
-                        leading: CircleAvatar(
-                          backgroundColor: Theme.of(context).colorScheme.primary,
-                          child: Text(
-                            c.name[0].toUpperCase(),
-                            style: const TextStyle(color: Colors.white),
-                          ),
-                        ),
-                        title: Text(
-                          c.name,
-                          style: const TextStyle(fontWeight: FontWeight.w600),
-                        ),
-                        subtitle: Text('${c.votes} vote(s)'),
-                        trailing: IconButton(
-                          icon: Icon(
-                            Icons.delete_outline,
-                            color: c.votes > 0 ? Colors.grey.shade400 : Colors.red.shade400,
-                          ),
-                          onPressed: () => removeCandidate(c.id, c.votes),
-                        ),
-                      ),
-                    );
-                  },
+                    ),
+                    onSubmitted: (_) => addCandidate(),
+                  ),
                 ),
+                const SizedBox(width: 10),
+                FilledButton(
+                  onPressed: _isSaving ? null : addCandidate,
+                  style: FilledButton.styleFrom(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 22,
+                      vertical: 18,
+                    ),
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(14),
+                    ),
+                  ),
+                  child: _isSaving ? const CircularProgressIndicator(color: Colors.white) : const Text('Add'),
+                ),
+              ],
+            ),
+          ),
+
+          // Photo Picker UI
+          if (_pickedPhoto != null)
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 16),
+              child: ClipRRect(
+                borderRadius: BorderRadius.circular(12),
+                child: Image.file(_pickedPhoto!, height: 100, width: double.infinity, fit: BoxFit.cover),
               ),
-            ],
-          );
-        },
+            ),
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+            child: OutlinedButton.icon(
+              onPressed: _isSaving ? null : _pickPhoto,
+              icon: const Icon(Icons.photo),
+              label: const Text('Pick a photo'),
+            ),
+          ),
+
+          const Divider(height: 1),
+          Expanded(
+            child: candidates.isEmpty
+                ? const Center(
+              child: Text(
+                'No candidates yet',
+                style: TextStyle(fontSize: 16, color: Colors.grey),
+              ),
+            )
+                : ListView.builder(
+              padding: const EdgeInsets.fromLTRB(16, 12, 16, 24),
+              itemCount: candidates.length,
+              itemBuilder: (context, index) {
+                final c = candidates[index];
+                return Container(
+                  margin: const EdgeInsets.symmetric(vertical: 5),
+                  decoration: BoxDecoration(
+                    color: Colors.white,
+                    borderRadius: BorderRadius.circular(14),
+                    boxShadow: [
+                      BoxShadow(
+                        color: Colors.black.withValues(alpha: 0.03),
+                        blurRadius: 8,
+                        offset: const Offset(0, 2),
+                      ),
+                    ],
+                  ),
+                  child: ListTile(
+                    contentPadding: const EdgeInsets.symmetric(
+                      horizontal: 16,
+                      vertical: 6,
+                    ),
+                    leading: CircleAvatar(
+                      backgroundColor: Theme.of(context).colorScheme.primary,
+                      backgroundImage: c.photoUrl != null ? NetworkImage(c.photoUrl!) : null,
+                      child: c.photoUrl == null
+                          ? Text(
+                        c.name[0].toUpperCase(),
+                        style: const TextStyle(color: Colors.white),
+                      )
+                          : null,
+                    ),
+                    title: Text(
+                      c.name,
+                      style: const TextStyle(fontWeight: FontWeight.w600),
+                    ),
+                    subtitle: Text('${c.votes} vote(s)'),
+                    trailing: IconButton(
+                      icon: Icon(
+                        Icons.delete_outline,
+                        color: c.votes > 0 ? Colors.grey.shade400 : Colors.red.shade400,
+                      ),
+                      onPressed: () => removeCandidate(c.id, c.votes),
+                    ),
+                  ),
+                );
+              },
+            ),
+          ),
+        ],
       ),
     );
   }
@@ -640,136 +655,133 @@ class ResultsScreen extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final state = context.watch<CandidateState>();
+    final total = state.totalVotes;
+    final sorted = [...state.candidates]..sort((a, b) => b.votes.compareTo(a.votes));
+
+    if (state.loading) return const Center(child: CircularProgressIndicator());
+    if (sorted.isEmpty) return const Center(child: Text('No candidates yet'));
+
+    // Banner logic
+    Widget banner;
+    if (total == 0) {
+      banner = const _Banner(
+        colors: [Color(0xFF6B7280), Color(0xFF4B5563)],
+        icon: Icons.hourglass_empty,
+        title: 'No votes yet',
+        subtitle: 'Cast a vote to see results',
+      );
+    } else {
+      final top = sorted.first.votes;
+      final winners = sorted.where((c) => c.votes == top).toList();
+      if (winners.length > 1) {
+        final names = winners.map((c) => c.name).join(' and ');
+        banner = _Banner(
+          colors: const [Color(0xFFF59E0B), Color(0xFFEA580C)],
+          icon: Icons.balance,
+          title: 'Tie',
+          subtitle: '$names · $top votes each',
+        );
+      } else {
+        banner = _Banner(
+          colors: const [Color(0xFF10B981), Color(0xFF059669)],
+          icon: Icons.emoji_events,
+          title: 'Winner: ${winners.first.name}',
+          subtitle: '$top vote${top == 1 ? '' : 's'}',
+        );
+      }
+    }
+
     return Scaffold(
       appBar: AppBar(title: const Text('Results')),
-      body: StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
-        stream: myCandidates().snapshots(),
-        builder: (context, snapshot) {
-          if (!snapshot.hasData) return const Center(child: CircularProgressIndicator());
-
-          final candidates = snapshot.data!.docs.map(Candidate.fromDoc).toList();
-          final total = candidates.fold<int>(0, (sum, c) => sum + c.votes);
-          final sorted = [...candidates]..sort((a, b) => b.votes.compareTo(a.votes));
-
-          if (sorted.isEmpty) return const Center(child: Text('No candidates yet'));
-
-          // Banner logic
-          Widget banner;
-          if (total == 0) {
-            banner = const _Banner(
-              colors: [Color(0xFF6B7280), Color(0xFF4B5563)],
-              icon: Icons.hourglass_empty,
-              title: 'No votes yet',
-              subtitle: 'Cast a vote to see results',
-            );
-          } else {
-            final top = sorted.first.votes;
-            final winners = sorted.where((c) => c.votes == top).toList();
-            if (winners.length > 1) {
-              final names = winners.map((c) => c.name).join(' and ');
-              banner = _Banner(
-                colors: const [Color(0xFFF59E0B), Color(0xFFEA580C)],
-                icon: Icons.balance,
-                title: 'Tie',
-                subtitle: '$names · $top votes each',
-              );
-            } else {
-              banner = _Banner(
-                colors: const [Color(0xFF10B981), Color(0xFF059669)],
-                icon: Icons.emoji_events,
-                title: 'Winner: ${winners.first.name}',
-                subtitle: '$top vote${top == 1 ? '' : 's'}',
-              );
-            }
-          }
-
-          return Padding(
-            padding: const EdgeInsets.all(16),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.stretch,
-              children: [
-                banner,
-                const SizedBox(height: 16),
-                Expanded(
-                  child: ListView.builder(
-                    itemCount: sorted.length,
-                    itemBuilder: (context, index) {
-                      final c = sorted[index];
-                      final pct = total == 0 ? 0.0 : c.votes / total;
-                      final position = index + 1;
-                      return Container(
-                        margin: const EdgeInsets.symmetric(vertical: 5),
-                        padding: const EdgeInsets.all(14),
-                        decoration: BoxDecoration(
-                          color: Colors.white,
-                          borderRadius: BorderRadius.circular(16),
-                          boxShadow: [
-                            BoxShadow(
-                              color: Colors.black.withValues(alpha: 0.04),
-                              blurRadius: 10,
-                              offset: const Offset(0, 4),
-                            ),
-                          ],
+      body: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            banner,
+            const SizedBox(height: 16),
+            Expanded(
+              child: ListView.builder(
+                itemCount: sorted.length,
+                itemBuilder: (context, index) {
+                  final c = sorted[index];
+                  final pct = total == 0 ? 0.0 : c.votes / total;
+                  final position = index + 1;
+                  return Container(
+                    margin: const EdgeInsets.symmetric(vertical: 5),
+                    padding: const EdgeInsets.all(14),
+                    decoration: BoxDecoration(
+                      color: Colors.white,
+                      borderRadius: BorderRadius.circular(16),
+                      boxShadow: [
+                        BoxShadow(
+                          color: Colors.black.withValues(alpha: 0.04),
+                          blurRadius: 10,
+                          offset: const Offset(0, 4),
                         ),
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
+                      ],
+                    ),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Row(
                           children: [
-                            Row(
-                              children: [
-                                CircleAvatar(
-                                  radius: 14,
-                                  backgroundColor: _medalColor(position),
-                                  child: Text(
-                                    '$position',
-                                    style: const TextStyle(
-                                      color: Colors.white,
-                                      fontSize: 12,
-                                      fontWeight: FontWeight.w700,
-                                    ),
-                                  ),
+                            CircleAvatar(
+                              radius: 14,
+                              backgroundColor: _medalColor(position),
+                              backgroundImage: c.photoUrl != null ? NetworkImage(c.photoUrl!) : null,
+                              child: c.photoUrl == null
+                                  ? Text(
+                                '$position',
+                                style: const TextStyle(
+                                  color: Colors.white,
+                                  fontSize: 12,
+                                  fontWeight: FontWeight.w700,
                                 ),
-                                const SizedBox(width: 10),
-                                Expanded(
-                                  child: Text(
-                                    c.name,
-                                    style: const TextStyle(
-                                      fontSize: 16,
-                                      fontWeight: FontWeight.w600,
-                                    ),
-                                  ),
-                                ),
-                                Text(
-                                  '${c.votes} (${(pct * 100).toStringAsFixed(1)}%)',
-                                  style: TextStyle(
-                                    fontSize: 13,
-                                    fontWeight: FontWeight.w600,
-                                    color: Colors.grey.shade700,
-                                  ),
-                                ),
-                              ],
+                              )
+                                  : null,
                             ),
-                            const SizedBox(height: 10),
-                            ClipRRect(
-                              borderRadius: BorderRadius.circular(8),
-                              child: LinearProgressIndicator(
-                                value: pct,
-                                minHeight: 10,
-                                backgroundColor: Colors.grey.shade200,
-                                valueColor: AlwaysStoppedAnimation(
-                                  _medalColor(position),
+                            const SizedBox(width: 10),
+                            Expanded(
+                              child: Text(
+                                c.name,
+                                style: const TextStyle(
+                                  fontSize: 16,
+                                  fontWeight: FontWeight.w600,
                                 ),
+                              ),
+                            ),
+                            Text(
+                              '${c.votes} (${(pct * 100).toStringAsFixed(1)}%)',
+                              style: TextStyle(
+                                fontSize: 13,
+                                fontWeight: FontWeight.w600,
+                                color: Colors.grey.shade700,
                               ),
                             ),
                           ],
                         ),
-                      );
-                    },
-                  ),
-                ),
-              ],
+                        const SizedBox(height: 10),
+                        ClipRRect(
+                          borderRadius: BorderRadius.circular(8),
+                          child: LinearProgressIndicator(
+                            value: pct,
+                            minHeight: 10,
+                            backgroundColor: Colors.grey.shade200,
+                            valueColor: AlwaysStoppedAnimation(
+                              _medalColor(position),
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                  );
+                },
+              ),
             ),
-          );
-        },
+          ],
+        ),
       ),
     );
   }
